@@ -1,8 +1,9 @@
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { normalizeApiUrl } from "../src/api.js";
+import { runCli } from "../src/cli.js";
 import { createVibcodrxMcpServer } from "../src/mcp.js";
 import { sanitizeRemoteUrl } from "../src/project.js";
 
@@ -28,6 +29,23 @@ describe("Vibcodrx CLI", () => {
       .toBe("ssh://github.com/vibcodr/vibcodrx");
     expect(sanitizeRemoteUrl("https://token@example.com/org/repo.git?secret=1"))
       .toBe("https://example.com/org/repo");
+  });
+
+  it("trata ajuda após um subcomando sem executar a ação", async () => {
+    const output: string[] = [];
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk) => {
+        output.push(String(chunk));
+        return true;
+      });
+    try {
+      await runCli(["logout", "--help"]);
+    } finally {
+      write.mockRestore();
+    }
+    expect(output.join("")).toContain("Vibcodrx CLI");
+    expect(output.join("")).not.toContain("Sessão Vibcodrx encerrada");
   });
 
   it("conclui o handshake e lista ferramentas mesmo sem rede ou login", async () => {

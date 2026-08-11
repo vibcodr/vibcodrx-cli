@@ -171,8 +171,13 @@ Opções:
 }
 
 export async function runCli(args: string[]): Promise<void> {
+  const commands = commandArguments(args);
+  if (commands.includes("--help") || commands.includes("-h")) {
+    help();
+    return;
+  }
   apiUrlArgument(args);
-  const [command] = commandArguments(args);
+  const [command] = commands;
   if (command === "mcp") {
     await runMcpServer();
     return;
