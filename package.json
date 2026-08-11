@@ -1,6 +1,6 @@
 {
   "name": "@vibcodrx/cli",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Conecta o Codex em hosts remotos ao ecossistema Vibcodrx.",
   "type": "module",
   "bin": {
@@ -36,11 +36,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
+    "ws": "^8.21.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
     "@types/node": "^26.2.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^6.0.2",
     "vitest": "^4.1.10"
   }

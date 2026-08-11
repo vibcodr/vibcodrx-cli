@@ -1,0 +1,645 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { createServer as createNetServer } from "node:net";
+import { hostname } from "node:os";
+import { basename } from "node:path";
+
+import { WebSocket, WebSocketServer, type RawData } from "ws";
+
+import { sessionApiRequest } from "./api.js";
+import { loadSession, type StoredSession } from "./config.js";
+import { packageVersion } from "./constants.js";
+import { getProjectIdentity } from "./project.js";
+
+type JsonObject = Record<string, unknown>;
+type RuntimePresence = "idle" | "running" | "waiting-user" | "offline";
+type ThreadStatus =
+  | { type: "notLoaded" | "idle" | "systemError" }
+  | { type: "active"; activeFlags: string[] };
+
+type PendingRequest = {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+  timer: NodeJS.Timeout;
+};
+
+type WorkspaceContext = {
+  id?: string;
+  name: string;
+};
+
+function isRecord(value: unknown): value is JsonObject {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function rawDataToString(data: RawData): string {
+  if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  return data.toString("utf8");
+}
+
+function rpcIdKey(id: unknown): string | null {
+  return typeof id === "string" || typeof id === "number" || id === null
+    ? `${typeof id}:${String(id)}`
+    : null;
+}
+
+function toPresence(status: ThreadStatus): RuntimePresence {
+  if (status.type === "idle") return "idle";
+  if (status.type !== "active") return "offline";
+  return status.activeFlags.length > 0 ? "waiting-user" : "running";
+}
+
+function runtimeAddress(): string {
+  return `terminal-${randomBytes(9).toString("base64url")}`;
+}
+
+function runtimeCapability(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+function normalizeAlias(value: string): string {
+  const alias = value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72);
+  return alias || "remote-codex";
+}
+
+async function getFreeLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createNetServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Não foi possível reservar uma porta loopback."));
+        return;
+      }
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(address.port);
+      });
+    });
+  });
+}
+
+async function waitForAppServer(url: string, process: ChildProcess): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (process.exitCode !== null) throw new Error("O Codex App Server encerrou durante o startup.");
+    try {
+      const response = await fetch(`${url.replace("ws://", "http://")}/readyz`);
+      if (response.ok) return;
+    } catch {
+      // The listener is expected to refuse connections during startup.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("O Codex App Server não ficou pronto a tempo.");
+}
+
+class AppServerAdapter {
+  private readonly pending = new Map<number, PendingRequest>();
+  private nextId = 0;
+  private socket: WebSocket | null = null;
+
+  constructor(private readonly endpoint: string) {}
+
+  async connect(): Promise<void> {
+    const socket = new WebSocket(this.endpoint);
+    this.socket = socket;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Timeout ao conectar ao Codex App Server.")), 5_000);
+      socket.once("open", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      socket.once("error", () => {
+        clearTimeout(timer);
+        reject(new Error("Não foi possível conectar ao Codex App Server."));
+      });
+    });
+    socket.on("message", (data) => this.handleMessage(rawDataToString(data)));
+    socket.on("close", () => {
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("A conexão com o Codex App Server foi encerrada."));
+      }
+      this.pending.clear();
+    });
+    await this.request("initialize", {
+      clientInfo: {
+        name: "vibcodrx_cli",
+        title: "Vibcodrx CLI",
+        version: packageVersion,
+      },
+      capabilities: { experimentalApi: false, requestAttestation: false },
+    });
+    socket.send(JSON.stringify({ method: "initialized", params: {} }));
+  }
+
+  request(method: string, params: unknown): Promise<unknown> {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("Codex App Server indisponível."));
+    }
+    const id = ++this.nextId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Timeout no Codex App Server: ${method}`));
+      }, 15_000);
+      this.pending.set(id, { resolve, reject, timer });
+      socket.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  close(): void {
+    this.socket?.close();
+    this.socket = null;
+  }
+
+  private handleMessage(payload: string): void {
+    let message: unknown;
+    try {
+      message = JSON.parse(payload) as unknown;
+    } catch {
+      return;
+    }
+    if (!isRecord(message)) return;
+    if (typeof message.id === "number" && message.method === undefined) {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pending.delete(message.id);
+      if (isRecord(message.error)) {
+        pending.reject(new Error(String(message.error.message ?? "Erro do Codex App Server.")));
+      } else {
+        pending.resolve(message.result);
+      }
+      return;
+    }
+    if (typeof message.method === "string" && message.id !== undefined) {
+      this.socket?.send(JSON.stringify({
+        id: message.id,
+        error: { code: -32601, message: "Unsupported observer request" },
+      }));
+    }
+  }
+}
+
+async function resolveWorkspace(session: StoredSession, cwd: string): Promise<WorkspaceContext> {
+  const fallback = { name: basename(cwd) || hostname() || "Host remoto" };
+  try {
+    const project = await getProjectIdentity(cwd);
+    const result = await sessionApiRequest<JsonObject>(session, "/v1/projects/resolve", {
+      method: "POST",
+      body: JSON.stringify(project),
+    });
+    if (!isRecord(result.match)) return fallback;
+    const workspaceId = result.match.workspaceId;
+    const workspaceName = result.match.workspaceName;
+    if (typeof workspaceId !== "string" || typeof workspaceName !== "string") return fallback;
+    return { id: workspaceId, name: workspaceName };
+  } catch {
+    return fallback;
+  }
+}
+
+class RuntimeBridge {
+  private activeTurnId: string | null = null;
+  private brokerSocket: WebSocket | null = null;
+  private brokerReconnectTimer: NodeJS.Timeout | null = null;
+  private brokerReconnectAttempt = 0;
+  private stopped = false;
+  private threadId: string | null = null;
+  private presence: RuntimePresence = "offline";
+  private published = false;
+
+  constructor(
+    private readonly session: StoredSession,
+    private readonly adapter: AppServerAdapter,
+    private readonly workspace: WorkspaceContext,
+    private readonly cwd: string,
+    readonly address: string,
+    readonly capability: string,
+  ) {}
+
+  environment(): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      VIBCODRX_RUNTIME_ADDRESS: this.address,
+      VIBCODRX_RUNTIME_CAPABILITY: this.capability,
+      VIBCODRX_RUNTIME_WORKSPACE_NAME: this.workspace.name,
+      ...(this.workspace.id ? { VIBCODRX_RUNTIME_WORKSPACE_ID: this.workspace.id } : {}),
+    };
+  }
+
+  start(): void {
+    this.connectBroker();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.brokerReconnectTimer) clearTimeout(this.brokerReconnectTimer);
+    this.brokerReconnectTimer = null;
+    const socket = this.brokerSocket;
+    this.brokerSocket = null;
+    if (socket?.readyState === WebSocket.OPEN) {
+      if (this.threadId) {
+        socket.send(JSON.stringify({
+          type: "unregister",
+          address: this.address,
+          capability: this.capability,
+        }));
+      }
+      socket.close(1000, "Codex runtime ended");
+    } else {
+      socket?.terminate();
+    }
+  }
+
+  bindThread(threadId: string): void {
+    this.threadId = threadId;
+    this.setPresence("idle");
+  }
+
+  handleNotification(method: string, params: unknown): void {
+    if (!this.threadId || !isRecord(params) || params.threadId !== this.threadId) return;
+    if (method === "thread/status/changed" && isRecord(params.status)) {
+      this.setPresence(toPresence(params.status as ThreadStatus));
+      if (this.presence === "idle" || this.presence === "offline") this.activeTurnId = null;
+    } else if (method === "turn/started" && isRecord(params.turn) && typeof params.turn.id === "string") {
+      this.activeTurnId = params.turn.id;
+      this.setPresence("running");
+    } else if (method === "turn/completed") {
+      this.activeTurnId = null;
+      this.setPresence("idle");
+    } else if (method === "thread/closed") {
+      this.activeTurnId = null;
+      this.setPresence("offline");
+    }
+  }
+
+  private participant(): JsonObject {
+    const host = hostname().slice(0, 60) || "host-remoto";
+    const project = basename(this.cwd).slice(0, 60) || this.workspace.name;
+    const title = `Codex · ${host}`.slice(0, 120);
+    return {
+      address: this.address,
+      capability: this.capability,
+      alias: normalizeAlias(`${host}-${project}`),
+      title,
+      description: `${title} — ${this.workspace.name}`.slice(0, 160),
+      status: this.presence,
+      workspace: {
+        name: this.workspace.name,
+        ...(this.workspace.id ? { id: this.workspace.id } : {}),
+      },
+    };
+  }
+
+  private setPresence(presence: RuntimePresence): void {
+    this.presence = presence;
+    this.publish();
+  }
+
+  private publish(): void {
+    const socket = this.brokerSocket;
+    if (!this.threadId || socket?.readyState !== WebSocket.OPEN) return;
+    if (this.presence === "offline") {
+      if (this.published) {
+        socket.send(JSON.stringify({
+          type: "unregister",
+          address: this.address,
+          capability: this.capability,
+        }));
+        this.published = false;
+      }
+      return;
+    }
+    socket.send(JSON.stringify({ type: "register", participant: this.participant() }));
+    this.published = true;
+  }
+
+  private connectBroker(): void {
+    if (this.stopped || this.brokerSocket) return;
+    const endpoint = new URL("/v1/runtime/live", this.session.apiUrl);
+    endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(endpoint, {
+      handshakeTimeout: 10_000,
+      headers: {
+        Authorization: `Bearer ${this.session.accessToken}`,
+        "X-Vibcodrx-Device-Id": this.session.device.id,
+      },
+    });
+    this.brokerSocket = socket;
+    socket.on("open", () => {
+      if (this.brokerSocket !== socket) return;
+      this.brokerReconnectAttempt = 0;
+      this.published = false;
+      this.publish();
+    });
+    socket.on("message", (data) => void this.handleBrokerMessage(socket, data));
+    socket.on("error", () => {
+      // The close handler reconnects while the TUI is alive.
+    });
+    socket.on("close", () => {
+      if (this.brokerSocket === socket) {
+        this.brokerSocket = null;
+        this.published = false;
+      }
+      this.scheduleBrokerReconnect();
+    });
+  }
+
+  private scheduleBrokerReconnect(): void {
+    if (this.stopped || this.brokerReconnectTimer) return;
+    const base = Math.min(30_000, 1_000 * (2 ** this.brokerReconnectAttempt));
+    this.brokerReconnectAttempt = Math.min(this.brokerReconnectAttempt + 1, 5);
+    const delay = Math.round(base * (0.8 + Math.random() * 0.4));
+    this.brokerReconnectTimer = setTimeout(() => {
+      this.brokerReconnectTimer = null;
+      this.connectBroker();
+    }, delay);
+    this.brokerReconnectTimer.unref();
+  }
+
+  private async handleBrokerMessage(socket: WebSocket, data: RawData): Promise<void> {
+    let event: unknown;
+    try {
+      event = JSON.parse(rawDataToString(data)) as unknown;
+    } catch {
+      socket.close(1003, "Invalid runtime message");
+      return;
+    }
+    if (!isRecord(event) || event.type !== "deliver" || event.target !== this.address) return;
+    if (!isRecord(event.message)) return;
+    const message = event.message;
+    if (
+      typeof message.id !== "string" ||
+      typeof message.content !== "string" ||
+      !isRecord(message.sender) ||
+      typeof message.sender.address !== "string" ||
+      typeof message.sender.alias !== "string" ||
+      !isRecord(message.sender.workspace) ||
+      typeof message.sender.workspace.name !== "string"
+    ) return;
+    try {
+      await this.deliver({
+        id: message.id,
+        content: message.content,
+        senderAddress: message.sender.address,
+        senderAlias: message.sender.alias,
+        senderWorkspaceName: message.sender.workspace.name,
+      });
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "delivery_ack", messageId: message.id, delivered: true }));
+      }
+    } catch (error) {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          type: "delivery_ack",
+          messageId: message.id,
+          delivered: false,
+          error: error instanceof Error ? error.message.slice(0, 500) : "Delivery failed",
+        }));
+      }
+    }
+  }
+
+  private async refreshThread(): Promise<void> {
+    if (!this.threadId) throw new Error("A sessão Codex ainda não possui thread.");
+    const result = await this.adapter.request("thread/read", {
+      threadId: this.threadId,
+      includeTurns: true,
+    });
+    if (!isRecord(result) || !isRecord(result.thread)) throw new Error("Estado inválido da thread Codex.");
+    const thread = result.thread;
+    if (isRecord(thread.status)) this.presence = toPresence(thread.status as ThreadStatus);
+    const activeTurn = Array.isArray(thread.turns)
+      ? thread.turns
+          .filter((turn): turn is JsonObject => isRecord(turn) && turn.status === "inProgress" && typeof turn.id === "string")
+          .sort((left, right) => Number(right.startedAt ?? 0) - Number(left.startedAt ?? 0))[0]
+      : undefined;
+    this.activeTurnId = typeof activeTurn?.id === "string" ? activeTurn.id : null;
+  }
+
+  private async deliver(message: {
+    id: string;
+    content: string;
+    senderAddress: string;
+    senderAlias: string;
+    senderWorkspaceName: string;
+  }): Promise<void> {
+    await this.refreshThread();
+    if (!this.threadId || this.presence === "offline") throw new Error("Recipient is unavailable");
+    const envelope = [
+      `[Mensagem recebida de ${message.senderAlias} — Workspace: ${message.senderWorkspaceName}]`,
+      `Endereço do remetente: ${message.senderAddress}`,
+      `ID: ${message.id}`,
+      "",
+      `Conteúdo: ${message.content}`,
+    ].join("\n");
+    if (this.presence === "idle") {
+      await this.adapter.request("turn/start", {
+        threadId: this.threadId,
+        clientUserMessageId: message.id,
+        input: [{ type: "text", text: envelope, text_elements: [] }],
+        cwd: this.cwd,
+      });
+    } else {
+      if (!this.activeTurnId) throw new Error("Recipient active turn is unavailable");
+      await this.adapter.request("turn/steer", {
+        threadId: this.threadId,
+        clientUserMessageId: message.id,
+        input: [{ type: "text", text: envelope, text_elements: [] }],
+        expectedTurnId: this.activeTurnId,
+      });
+    }
+    this.setPresence("running");
+  }
+}
+
+function shouldManageCodex(args: string[]): boolean {
+  const first = args[0];
+  return first === undefined || first === "resume" || first === "fork";
+}
+
+async function runRealCodex(args: string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("codex", args, { stdio: "inherit", env: process.env });
+    child.once("error", reject);
+    child.once("exit", (code) => resolve(code ?? 1));
+  });
+}
+
+export async function runManagedCodex(args: string[]): Promise<void> {
+  if (!shouldManageCodex(args)) {
+    process.exitCode = await runRealCodex(args);
+    return;
+  }
+  const session = await loadSession();
+  if (!session || Date.parse(session.expiresAt) <= Date.now()) {
+    process.stderr.write("Vibcodrx: sessão ausente ou expirada; iniciando Codex sem runtime distribuído.\n");
+    process.exitCode = await runRealCodex(args);
+    return;
+  }
+
+  const cwd = process.cwd();
+  const workspace = await resolveWorkspace(session, cwd);
+  const address = runtimeAddress();
+  const capability = runtimeCapability();
+  const appServerPort = await getFreeLoopbackPort();
+  const appServerUrl = `ws://127.0.0.1:${appServerPort}`;
+  const adapter = new AppServerAdapter(appServerUrl);
+  let bridge: RuntimeBridge | null = null;
+  const appServer = spawn("codex", [
+    "app-server",
+    "--disable",
+    "apps",
+    "--listen",
+    appServerUrl,
+  ], {
+    cwd,
+    env: {
+      ...process.env,
+      VIBCODRX_RUNTIME_ADDRESS: address,
+      VIBCODRX_RUNTIME_CAPABILITY: capability,
+      VIBCODRX_RUNTIME_WORKSPACE_NAME: workspace.name,
+      ...(workspace.id ? { VIBCODRX_RUNTIME_WORKSPACE_ID: workspace.id } : {}),
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+    detached: process.platform !== "win32",
+  });
+  const killAppServer = (signal: NodeJS.Signals): void => {
+    if (appServer.exitCode !== null || appServer.pid === undefined) return;
+    if (process.platform !== "win32") {
+      try {
+        process.kill(-appServer.pid, signal);
+        return;
+      } catch {
+        // Fall back to killing only the direct child.
+      }
+    }
+    appServer.kill(signal);
+  };
+  appServer.stderr?.setEncoding("utf8");
+  appServer.stderr?.on("data", () => {
+    // Consume diagnostics without echoing data that may contain user paths or secrets.
+  });
+
+  let proxyServer: WebSocketServer | null = null;
+  let tui: ChildProcess | null = null;
+  const appServerSpawned = new Promise<void>((resolve, reject) => {
+    appServer.once("spawn", resolve);
+    appServer.once("error", () => reject(new Error("Não foi possível iniciar o Codex App Server.")));
+  });
+  const swallowSigint = (): void => undefined;
+  const handleTermination = (signal: NodeJS.Signals): void => {
+    if (tui?.exitCode === null) tui.kill(signal);
+    else killAppServer(signal);
+  };
+  process.on("SIGINT", swallowSigint);
+  process.on("SIGTERM", handleTermination);
+  process.on("SIGHUP", handleTermination);
+  try {
+    await appServerSpawned;
+    await waitForAppServer(appServerUrl, appServer);
+    await adapter.connect();
+    bridge = new RuntimeBridge(session, adapter, workspace, cwd, address, capability);
+    bridge.start();
+    const proxyPort = await getFreeLoopbackPort();
+    proxyServer = new WebSocketServer({ host: "127.0.0.1", port: proxyPort });
+    const proxyReady = new Promise<void>((resolve, reject) => {
+      proxyServer!.once("listening", resolve);
+      proxyServer!.once("error", reject);
+    });
+    proxyServer.on("connection", (clientSocket) => {
+      const upstreamSocket = new WebSocket(appServerUrl);
+      const pendingBindings = new Set<string>();
+      const pendingFrames: Array<{ data: RawData; isBinary: boolean }> = [];
+      const forwardClient = (data: RawData, isBinary: boolean): void => {
+        if (!isBinary) {
+          try {
+            const message = JSON.parse(rawDataToString(data)) as unknown;
+            if (isRecord(message)) {
+              const key = rpcIdKey(message.id);
+              if (
+                key &&
+                (message.method === "thread/start" || message.method === "thread/resume" || message.method === "thread/fork")
+              ) pendingBindings.add(key);
+            }
+          } catch {
+            // Invalid frames remain the App Server's responsibility.
+          }
+        }
+        upstreamSocket.send(data, { binary: isBinary });
+      };
+      clientSocket.on("message", (data, isBinary) => {
+        if (upstreamSocket.readyState === WebSocket.OPEN) forwardClient(data, isBinary);
+        else if (upstreamSocket.readyState === WebSocket.CONNECTING) pendingFrames.push({ data, isBinary });
+      });
+      upstreamSocket.on("open", () => {
+        for (const frame of pendingFrames.splice(0)) forwardClient(frame.data, frame.isBinary);
+      });
+      upstreamSocket.on("message", (data, isBinary) => {
+        if (!isBinary) {
+          try {
+            const message = JSON.parse(rawDataToString(data)) as unknown;
+            if (isRecord(message)) {
+              const key = rpcIdKey(message.id);
+              if (message.method === undefined && key && pendingBindings.delete(key)) {
+                if (isRecord(message.result) && isRecord(message.result.thread) && typeof message.result.thread.id === "string") {
+                  bridge?.bindThread(message.result.thread.id);
+                }
+              }
+              if (typeof message.method === "string" && message.id === undefined) {
+                bridge?.handleNotification(message.method, message.params);
+              }
+            }
+          } catch {
+            // The TUI receives the original frame.
+          }
+        }
+        if (clientSocket.readyState === WebSocket.OPEN) clientSocket.send(data, { binary: isBinary });
+      });
+      clientSocket.on("close", () => upstreamSocket.close());
+      clientSocket.on("error", () => upstreamSocket.terminate());
+      upstreamSocket.on("close", () => clientSocket.close());
+      upstreamSocket.on("error", () => clientSocket.close(1011, "Codex App Server unavailable"));
+    });
+    await proxyReady;
+
+    tui = spawn("codex", ["--remote", `ws://127.0.0.1:${proxyPort}`, ...args], {
+      cwd,
+      env: bridge.environment(),
+      stdio: "inherit",
+    });
+    process.exitCode = await new Promise<number>((resolve, reject) => {
+      tui!.once("error", reject);
+      tui!.once("exit", (code) => resolve(code ?? 1));
+    });
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : String(error));
+  } finally {
+    process.off("SIGINT", swallowSigint);
+    process.off("SIGTERM", handleTermination);
+    process.off("SIGHUP", handleTermination);
+    bridge?.stop();
+    proxyServer?.close();
+    adapter.close();
+    if (tui?.exitCode === null) tui.kill("SIGTERM");
+    if (appServer.exitCode === null) {
+      killAppServer("SIGTERM");
+      const forceTimer = setTimeout(() => {
+        if (appServer.exitCode === null) killAppServer("SIGKILL");
+      }, 1_000);
+      forceTimer.unref();
+    }
+  }
+}

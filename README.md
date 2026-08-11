@@ -14,7 +14,8 @@ O comando sem argumentos conduz um único fluxo:
 1. verifica se o Codex está instalado;
 2. abre a autorização do host no navegador, sem receber sua senha no terminal;
 3. registra o servidor MCP stdio com `codex mcp add vibcodrx -- vibcodrx mcp`;
-4. valida a conta e a API.
+4. instala a função de shell que preserva o comando `codex` e ativa o runtime distribuído;
+5. valida a conta e a API.
 
 Depois da configuração, use normalmente:
 
@@ -22,9 +23,9 @@ Depois da configuração, use normalmente:
 codex
 ```
 
-O próprio Codex inicia e encerra `vibcodrx mcp`. A primeira versão não instala daemon nem mantém processo permanente.
+Em sessões interativas, a função delega para `vibcodrx codex`, que supervisiona um Codex App Server loopback, a TUI oficial e a presença WSS. Fechar o Codex encerra todos esses filhos; não há daemon nem processo permanente.
 
-O MCP lista workspaces e contexto, resolve automaticamente o projeto pelo fingerprint Git e oferece CRUD de Anotações conectadas: listar, criar, ler, atualizar e excluir. A criação grava o node e a corda numa única transação.
+O MCP resolve automaticamente o projeto pelo fingerprint Git e oferece as mesmas treze tools canônicas do desktop: contexto, presença/mensagens, CRUD de Anotações conectadas e CRUD de Tasks. `list_workspaces` complementa o contrato com descoberta global do tenant. A criação de Anotação grava node e corda numa única transação.
 
 ## Comandos
 
@@ -35,6 +36,7 @@ vibcodrx logout      revoga e remove a credencial local
 vibcodrx status      mostra o estado atual
 vibcodrx doctor      testa Codex, MCP, conta e backend
 vibcodrx mcp         servidor stdio usado pelo Codex
+vibcodrx codex -- …  supervisor interno usado pela função de shell
 ```
 
 Para desenvolvimento local, `--api-url http://127.0.0.1:4100` ou `VIBCODRX_API_URL` troca o endpoint. HTTP é recusado fora de loopback.
@@ -44,6 +46,7 @@ Para desenvolvimento local, `--api-url http://127.0.0.1:4100` ou `VIBCODRX_API_U
 - O CLI recebe automaticamente os workspaces e nodes do tenant autenticado; não existe vínculo manual durante o setup.
 - O fingerprint do projeto usa uma URL Git sanitizada e envia apenas seu hash. O desktop registra esse vínculo automaticamente; CWD absoluto e credenciais de remote não são enviados.
 - Conteúdo de Anotações só pode ser lido ou alterado quando o Terminal informado possui uma corda persistida até aquela Anotação.
+- `list_available_threads` mostra somente sessões Codex vivas; mensagens cross-device são confirmadas apenas depois de injetadas no App Server destinatário.
 - O codebase, SSH, PTY e buffers do terminal não passam pelo backend Vibcodrx.
 - A credencial fica no keyring Linux quando disponível. Em host headless, o fallback é um arquivo XDG privado com modo `0600`.
 - O handshake MCP não depende da rede; falhas de API aparecem na chamada da ferramenta, sem congelar a inicialização do Codex.

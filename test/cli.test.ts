@@ -9,10 +9,16 @@ import { sanitizeRemoteUrl } from "../src/project.js";
 
 describe("Vibcodrx CLI", () => {
   const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+  const originalRuntimeAddress = process.env.VIBCODRX_RUNTIME_ADDRESS;
+  const originalRuntimeCapability = process.env.VIBCODRX_RUNTIME_CAPABILITY;
 
   afterEach(() => {
     if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+    if (originalRuntimeAddress === undefined) delete process.env.VIBCODRX_RUNTIME_ADDRESS;
+    else process.env.VIBCODRX_RUNTIME_ADDRESS = originalRuntimeAddress;
+    if (originalRuntimeCapability === undefined) delete process.env.VIBCODRX_RUNTIME_CAPABILITY;
+    else process.env.VIBCODRX_RUNTIME_CAPABILITY = originalRuntimeCapability;
   });
 
   it("aceita HTTPS público e limita HTTP a loopback", () => {
@@ -59,10 +65,24 @@ describe("Vibcodrx CLI", () => {
     ]);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toContain("vibcodrx_list_workspaces");
-      expect(tools.tools.map((tool) => tool.name)).toContain("vibcodrx_create_note");
+      expect(tools.tools.map((tool) => tool.name)).toEqual([
+        "list_workspaces",
+        "get_workspace_context",
+        "list_available_threads",
+        "send_message",
+        "list_connected_notes",
+        "read_connected_note",
+        "create_connected_note",
+        "update_connected_note",
+        "delete_connected_note",
+        "list_tasks",
+        "read_task",
+        "create_task",
+        "update_task",
+        "delete_task",
+      ]);
       const result = await client.callTool({
-        name: "vibcodrx_list_workspaces",
+        name: "list_workspaces",
         arguments: {},
       });
       expect(result.isError).toBe(true);

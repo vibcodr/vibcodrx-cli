@@ -9,6 +9,8 @@ import { normalizeApiUrl, sessionApiRequest, validateSession } from "./api.js";
 import { loginWithDeviceFlow } from "./device-auth.js";
 import { packageVersion } from "./constants.js";
 import { runMcpServer } from "./mcp.js";
+import { configureCodexLauncher } from "./launcher.js";
+import { runManagedCodex } from "./runtime.js";
 
 function apiUrlArgument(args: string[]): string | undefined {
   const index = args.indexOf("--api-url");
@@ -55,13 +57,13 @@ async function ensureAuthenticated(args: string[]): Promise<StoredSession> {
   if (existing) {
     try {
       const identity = await currentIdentity(existing);
-      process.stdout.write(`2/3 Conta: ${identity.user.name} · autenticada\n`);
+      process.stdout.write(`2/4 Conta: ${identity.user.name} · autenticada\n`);
       return existing;
     } catch {
-      process.stdout.write("2/3 Conta: sessão ausente ou expirada; nova autorização necessária.\n");
+      process.stdout.write("2/4 Conta: sessão ausente ou expirada; nova autorização necessária.\n");
     }
   } else {
-    process.stdout.write("2/3 Conta: autorização necessária.\n");
+    process.stdout.write("2/4 Conta: autorização necessária.\n");
   }
   return login(args);
 }
@@ -69,11 +71,18 @@ async function ensureAuthenticated(args: string[]): Promise<StoredSession> {
 async function wizard(args: string[]): Promise<void> {
   process.stdout.write("Vibcodrx · preparar este host\n\n");
   const codexVersion = await ensureCodexInstalled();
-  process.stdout.write(`1/3 Codex: ${codexVersion}\n`);
+  process.stdout.write(`1/4 Codex: ${codexVersion}\n`);
   await ensureAuthenticated(args);
   const mcp = await configureCodexMcp();
-  process.stdout.write(`3/3 MCP: ${mcp === "configured" ? "configurado" : "já estava correto"}\n\n`);
-  process.stdout.write("Pronto. A partir de agora, execute apenas `codex` neste host.\n");
+  process.stdout.write(`3/4 MCP: ${mcp === "configured" ? "configurado" : "já estava correto"}\n`);
+  const launcher = await configureCodexLauncher();
+  process.stdout.write(
+    `4/4 Runtime: ${launcher.status === "configured" ? "launcher configurado" : launcher.status === "unchanged" ? "já estava correto" : "shell não suportado"}\n\n`,
+  );
+  process.stdout.write("Pronto. Abra um novo shell e execute apenas `codex` neste host.\n");
+  if (launcher.status === "configured" && launcher.profilePath) {
+    process.stdout.write(`Para ativar no shell atual: source ${launcher.profilePath}\n`);
+  }
 }
 
 async function status(): Promise<void> {
@@ -162,6 +171,7 @@ Uso:
   vibcodrx status          mostra o estado atual
   vibcodrx doctor          valida Codex, MCP, conta e API
   vibcodrx mcp             inicia o servidor MCP stdio (usado pelo Codex)
+  vibcodrx codex -- [...]  launcher interno do runtime distribuído
 
 Opções:
   --api-url <url>          usa outra API; HTTP é aceito somente em localhost
@@ -171,6 +181,16 @@ Opções:
 }
 
 export async function runCli(args: string[]): Promise<void> {
+  const rawCommand = args[0];
+  if (rawCommand === "mcp") {
+    await runMcpServer();
+    return;
+  }
+  if (rawCommand === "codex") {
+    const runtimeArgs = args.slice(1);
+    await runManagedCodex(runtimeArgs[0] === "--" ? runtimeArgs.slice(1) : runtimeArgs);
+    return;
+  }
   const commands = commandArguments(args);
   if (commands.includes("--help") || commands.includes("-h")) {
     help();
@@ -178,10 +198,6 @@ export async function runCli(args: string[]): Promise<void> {
   }
   apiUrlArgument(args);
   const [command] = commands;
-  if (command === "mcp") {
-    await runMcpServer();
-    return;
-  }
   if (command === "--version" || command === "-v" || command === "version") {
     process.stdout.write(`${packageVersion}\n`);
     return;
