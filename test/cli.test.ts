@@ -6,6 +6,10 @@ import { normalizeApiUrl } from "../src/api.js";
 import { runCli } from "../src/cli.js";
 import { createVibcodrxMcpServer } from "../src/mcp.js";
 import { sanitizeRemoteUrl } from "../src/project.js";
+import {
+  appServerArguments,
+  runtimeMcpEnvironmentVariables,
+} from "../src/runtime.js";
 
 describe("Vibcodrx CLI", () => {
   const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
@@ -35,6 +39,21 @@ describe("Vibcodrx CLI", () => {
       .toBe("ssh://github.com/vibcodr/vibcodrx");
     expect(sanitizeRemoteUrl("https://token@example.com/org/repo.git?secret=1"))
       .toBe("https://example.com/org/repo");
+  });
+
+  it("encaminha somente o contexto runtime efêmero ao MCP do App Server", () => {
+    const args = appServerArguments("ws://127.0.0.1:4500");
+    expect(args).toContain("app-server");
+    expect(args).toContain("ws://127.0.0.1:4500");
+    expect(args.at(-1)).toBe(
+      `mcp_servers.vibcodrx.env_vars=${JSON.stringify(runtimeMcpEnvironmentVariables)}`,
+    );
+    expect(runtimeMcpEnvironmentVariables).toEqual([
+      "VIBCODRX_RUNTIME_ADDRESS",
+      "VIBCODRX_RUNTIME_CAPABILITY",
+      "VIBCODRX_RUNTIME_WORKSPACE_ID",
+      "VIBCODRX_RUNTIME_WORKSPACE_NAME",
+    ]);
   });
 
   it("trata ajuda após um subcomando sem executar a ação", async () => {

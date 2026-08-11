@@ -28,6 +28,25 @@ type WorkspaceContext = {
   name: string;
 };
 
+export const runtimeMcpEnvironmentVariables = [
+  "VIBCODRX_RUNTIME_ADDRESS",
+  "VIBCODRX_RUNTIME_CAPABILITY",
+  "VIBCODRX_RUNTIME_WORKSPACE_ID",
+  "VIBCODRX_RUNTIME_WORKSPACE_NAME",
+] as const;
+
+export function appServerArguments(endpoint: string): string[] {
+  return [
+    "app-server",
+    "--disable",
+    "apps",
+    "--listen",
+    endpoint,
+    "-c",
+    `mcp_servers.vibcodrx.env_vars=${JSON.stringify(runtimeMcpEnvironmentVariables)}`,
+  ];
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -498,13 +517,7 @@ export async function runManagedCodex(args: string[]): Promise<void> {
   const appServerUrl = `ws://127.0.0.1:${appServerPort}`;
   const adapter = new AppServerAdapter(appServerUrl);
   let bridge: RuntimeBridge | null = null;
-  const appServer = spawn("codex", [
-    "app-server",
-    "--disable",
-    "apps",
-    "--listen",
-    appServerUrl,
-  ], {
+  const appServer = spawn("codex", appServerArguments(appServerUrl), {
     cwd,
     env: {
       ...process.env,

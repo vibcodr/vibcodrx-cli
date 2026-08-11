@@ -23,7 +23,7 @@ Depois da configuração, use normalmente:
 codex
 ```
 
-Em sessões interativas, a função delega para `vibcodrx codex`, que supervisiona um Codex App Server loopback, a TUI oficial e a presença WSS. Fechar o Codex encerra todos esses filhos; não há daemon nem processo permanente.
+Em sessões interativas, a função delega para `vibcodrx codex`, que supervisiona um Codex App Server loopback, a TUI oficial e a presença WSS. O supervisor permite explicitamente que o App Server encaminhe ao MCP somente as quatro variáveis efêmeras de capability e contexto da sessão; os valores permanecem em memória e não entram na configuração persistida do Codex. Fechar o Codex encerra todos esses filhos; não há daemon nem processo permanente.
 
 O MCP resolve automaticamente o projeto pelo fingerprint Git e oferece as mesmas treze tools canônicas do desktop: contexto, presença/mensagens, CRUD de Anotações conectadas e CRUD de Tasks. `list_workspaces` complementa o contrato com descoberta global do tenant. A criação de Anotação grava node e corda numa única transação.
 
