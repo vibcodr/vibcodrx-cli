@@ -9,6 +9,7 @@ import { sanitizeRemoteUrl } from "../src/project.js";
 import {
   appServerArguments,
   runtimeMcpEnvironmentVariables,
+  threadSummaryRequest,
 } from "../src/runtime.js";
 
 describe("Vibcodrx CLI", () => {
@@ -54,6 +55,13 @@ describe("Vibcodrx CLI", () => {
       "VIBCODRX_RUNTIME_WORKSPACE_ID",
       "VIBCODRX_RUNTIME_WORKSPACE_NAME",
     ]);
+  });
+
+  it("consulta somente o summary estável da thread antes de entregar mensagens", () => {
+    expect(threadSummaryRequest("thread-123")).toEqual({
+      threadId: "thread-123",
+      includeTurns: false,
+    });
   });
 
   it("trata ajuda após um subcomando sem executar a ação", async () => {

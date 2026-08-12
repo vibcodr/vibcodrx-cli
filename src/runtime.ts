@@ -47,6 +47,13 @@ export function appServerArguments(endpoint: string): string[] {
   ];
 }
 
+export function threadSummaryRequest(threadId: string): {
+  threadId: string;
+  includeTurns: false;
+} {
+  return { threadId, includeTurns: false };
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -433,19 +440,14 @@ class RuntimeBridge {
 
   private async refreshThread(): Promise<void> {
     if (!this.threadId) throw new Error("A sessão Codex ainda não possui thread.");
-    const result = await this.adapter.request("thread/read", {
-      threadId: this.threadId,
-      includeTurns: true,
-    });
+    const result = await this.adapter.request("thread/read", threadSummaryRequest(this.threadId));
     if (!isRecord(result) || !isRecord(result.thread)) throw new Error("Estado inválido da thread Codex.");
     const thread = result.thread;
-    if (isRecord(thread.status)) this.presence = toPresence(thread.status as ThreadStatus);
-    const activeTurn = Array.isArray(thread.turns)
-      ? thread.turns
-          .filter((turn): turn is JsonObject => isRecord(turn) && turn.status === "inProgress" && typeof turn.id === "string")
-          .sort((left, right) => Number(right.startedAt ?? 0) - Number(left.startedAt ?? 0))[0]
-      : undefined;
-    this.activeTurnId = typeof activeTurn?.id === "string" ? activeTurn.id : null;
+    if (isRecord(thread.status)) {
+      const presence = toPresence(thread.status as ThreadStatus);
+      if (presence === "idle" || presence === "offline") this.activeTurnId = null;
+      this.setPresence(presence);
+    }
   }
 
   private async deliver(message: {
