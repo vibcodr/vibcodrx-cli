@@ -1,6 +1,9 @@
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { normalizeApiUrl } from "../src/api.js";
 import { runCli } from "../src/cli.js";
@@ -8,6 +11,9 @@ import { createVibcodrxMcpServer } from "../src/mcp.js";
 import { sanitizeRemoteUrl } from "../src/project.js";
 import {
   appServerArguments,
+  materializeRuntimeClipboardImage,
+  runtimeClipboardBindingSequence,
+  runtimeClipboardUnbindingSequence,
   runtimeMcpEnvironmentVariables,
   threadSummaryRequest,
 } from "../src/runtime.js";
@@ -62,6 +68,32 @@ describe("Vibcodrx CLI", () => {
       threadId: "thread-123",
       includeTurns: false,
     });
+  });
+
+  it("anuncia ao terminal somente o endereço remoto e a capability efêmera do clipboard", () => {
+    expect(runtimeClipboardBindingSequence("terminal-remote123456", "p".repeat(48))).toBe(
+      `\u001b]777;vibcodrx;remote-runtime;bind;terminal-remote123456;${"p".repeat(48)}\u0007`,
+    );
+    expect(runtimeClipboardUnbindingSequence("terminal-remote123456")).toBe(
+      "\u001b]777;vibcodrx;remote-runtime;clear;terminal-remote123456\u0007",
+    );
+  });
+
+  it("materializa imagem remota em arquivo privado e rejeita assinatura falsa", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vibcodrx-cli-test-"));
+    try {
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      const path = await materializeRuntimeClipboardImage(directory, png, "image/png");
+      expect(await readFile(path)).toEqual(png);
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      await expect(materializeRuntimeClipboardImage(
+        directory,
+        Buffer.from("not-an-image"),
+        "image/png",
+      )).rejects.toThrow(/signature/);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("trata ajuda após um subcomando sem executar a ação", async () => {

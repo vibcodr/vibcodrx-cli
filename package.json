@@ -1,6 +1,6 @@
 {
   "name": "@vibcodrx/cli",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Conecta o Codex em hosts remotos ao ecossistema Vibcodrx.",
   "type": "module",
   "bin": {

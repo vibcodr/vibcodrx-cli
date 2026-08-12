@@ -1,8 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { rmSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
-import { hostname } from "node:os";
-import { basename } from "node:path";
+import { hostname, tmpdir } from "node:os";
+import { basename, join } from "node:path";
 
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 
@@ -27,6 +29,84 @@ type WorkspaceContext = {
   id?: string;
   name: string;
 };
+
+type RuntimeClipboardMimeType = "image/gif" | "image/jpeg" | "image/png" | "image/webp";
+
+type IncomingClipboardTransfer = {
+  mimeType: RuntimeClipboardMimeType;
+  size: number;
+  chunkCount: number;
+  chunks: Array<Buffer | undefined>;
+  receivedBytes: number;
+  timer: NodeJS.Timeout;
+};
+
+const maximumRuntimeClipboardImageBytes = 25 * 1_024 * 1_024;
+const maximumRuntimeClipboardChunkCharacters = 70_000;
+const runtimeClipboardTransferIdPattern = /^clipboard_[0-9a-f-]{36}$/;
+const runtimeClipboardMimeTypes = new Set<RuntimeClipboardMimeType>([
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+const runtimeClipboardExtensions: Record<RuntimeClipboardMimeType, string> = {
+  "image/gif": "gif",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+};
+
+export function runtimeClipboardBindingSequence(address: string, capability: string): string {
+  return `\u001b]777;vibcodrx;remote-runtime;bind;${address};${capability}\u0007`;
+}
+
+export function runtimeClipboardUnbindingSequence(address: string): string {
+  return `\u001b]777;vibcodrx;remote-runtime;clear;${address}\u0007`;
+}
+
+function isRuntimeClipboardMimeType(value: unknown): value is RuntimeClipboardMimeType {
+  return typeof value === "string" && runtimeClipboardMimeTypes.has(value as RuntimeClipboardMimeType);
+}
+
+function hasRuntimeClipboardImageSignature(
+  bytes: Buffer,
+  mimeType: RuntimeClipboardMimeType,
+): boolean {
+  if (mimeType === "image/png") {
+    return bytes.length >= 8 && bytes.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
+  }
+  if (mimeType === "image/jpeg") {
+    return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  }
+  if (mimeType === "image/gif") {
+    const signature = bytes.subarray(0, 6).toString("ascii");
+    return signature === "GIF87a" || signature === "GIF89a";
+  }
+  return bytes.length >= 12 &&
+    bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+    bytes.subarray(8, 12).toString("ascii") === "WEBP";
+}
+
+export async function materializeRuntimeClipboardImage(
+  directory: string,
+  bytes: Buffer,
+  mimeType: RuntimeClipboardMimeType,
+): Promise<string> {
+  if (
+    bytes.length === 0 ||
+    bytes.length > maximumRuntimeClipboardImageBytes ||
+    !hasRuntimeClipboardImageSignature(bytes, mimeType)
+  ) throw new Error("Clipboard image signature is invalid");
+  const path = join(
+    directory,
+    `clipboard-${randomUUID()}.${runtimeClipboardExtensions[mimeType]}`,
+  );
+  await writeFile(path, bytes, { flag: "wx", mode: 0o600 });
+  return path;
+}
 
 export const runtimeMcpEnvironmentVariables = [
   "VIBCODRX_RUNTIME_ADDRESS",
@@ -245,6 +325,9 @@ class RuntimeBridge {
   private threadId: string | null = null;
   private presence: RuntimePresence = "offline";
   private published = false;
+  private clipboardBindingAnnounced = false;
+  private clipboardDirectory: string | null = null;
+  private readonly incomingClipboardTransfers = new Map<string, IncomingClipboardTransfer>();
 
   constructor(
     private readonly session: StoredSession,
@@ -253,6 +336,7 @@ class RuntimeBridge {
     private readonly cwd: string,
     readonly address: string,
     readonly capability: string,
+    private readonly clipboardCapability: string,
   ) {}
 
   environment(): NodeJS.ProcessEnv {
@@ -271,6 +355,17 @@ class RuntimeBridge {
 
   stop(): void {
     this.stopped = true;
+    this.unannounceClipboardBinding();
+    for (const transfer of this.incomingClipboardTransfers.values()) clearTimeout(transfer.timer);
+    this.incomingClipboardTransfers.clear();
+    if (this.clipboardDirectory) {
+      try {
+        rmSync(this.clipboardDirectory, { recursive: true, force: true });
+      } catch {
+        // Cleanup remains best-effort during process shutdown.
+      }
+      this.clipboardDirectory = null;
+    }
     if (this.brokerReconnectTimer) clearTimeout(this.brokerReconnectTimer);
     this.brokerReconnectTimer = null;
     const socket = this.brokerSocket;
@@ -318,6 +413,7 @@ class RuntimeBridge {
     return {
       address: this.address,
       capability: this.capability,
+      clipboardCapability: this.clipboardCapability,
       alias: normalizeAlias(`${host}-${project}`),
       title,
       description: `${title} — ${this.workspace.name}`.slice(0, 160),
@@ -338,6 +434,7 @@ class RuntimeBridge {
     const socket = this.brokerSocket;
     if (!this.threadId || socket?.readyState !== WebSocket.OPEN) return;
     if (this.presence === "offline") {
+      this.unannounceClipboardBinding();
       if (this.published) {
         socket.send(JSON.stringify({
           type: "unregister",
@@ -379,6 +476,7 @@ class RuntimeBridge {
         this.brokerSocket = null;
         this.published = false;
       }
+      this.unannounceClipboardBinding();
       this.scheduleBrokerReconnect();
     });
   }
@@ -403,7 +501,25 @@ class RuntimeBridge {
       socket.close(1003, "Invalid runtime message");
       return;
     }
-    if (!isRecord(event) || event.type !== "deliver" || event.target !== this.address) return;
+    if (!isRecord(event)) return;
+    if (event.type === "registered" && event.address === this.address) {
+      this.announceClipboardBinding();
+      return;
+    }
+    if (event.target !== this.address) return;
+    if (event.type === "clipboard_start") {
+      this.handleClipboardStart(socket, event);
+      return;
+    }
+    if (event.type === "clipboard_chunk") {
+      this.handleClipboardChunk(socket, event);
+      return;
+    }
+    if (event.type === "clipboard_end") {
+      await this.handleClipboardEnd(socket, event);
+      return;
+    }
+    if (event.type !== "deliver") return;
     if (!isRecord(event.message)) return;
     const message = event.message;
     if (
@@ -436,6 +552,143 @@ class RuntimeBridge {
         }));
       }
     }
+  }
+
+  private announceClipboardBinding(): void {
+    if (this.clipboardBindingAnnounced || !this.threadId || this.presence === "offline") return;
+    process.stdout.write(runtimeClipboardBindingSequence(this.address, this.clipboardCapability));
+    this.clipboardBindingAnnounced = true;
+  }
+
+  private unannounceClipboardBinding(): void {
+    if (!this.clipboardBindingAnnounced) return;
+    process.stdout.write(runtimeClipboardUnbindingSequence(this.address));
+    this.clipboardBindingAnnounced = false;
+  }
+
+  private sendClipboardAcknowledgement(
+    socket: WebSocket,
+    transferId: string,
+    delivered: boolean,
+    value?: { path?: string; error?: string },
+  ): void {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({
+      type: "clipboard_ack",
+      transferId,
+      delivered,
+      ...(value?.path ? { path: value.path } : {}),
+      ...(value?.error ? { error: value.error.slice(0, 500) } : {}),
+    }));
+  }
+
+  private rejectClipboardTransfer(socket: WebSocket, transferId: string, error: string): void {
+    const transfer = this.incomingClipboardTransfers.get(transferId);
+    if (transfer) clearTimeout(transfer.timer);
+    this.incomingClipboardTransfers.delete(transferId);
+    this.sendClipboardAcknowledgement(socket, transferId, false, { error });
+  }
+
+  private handleClipboardStart(socket: WebSocket, event: JsonObject): void {
+    if (!isRecord(event.transfer)) return;
+    const transfer = event.transfer;
+    if (
+      typeof transfer.id !== "string" ||
+      !runtimeClipboardTransferIdPattern.test(transfer.id) ||
+      !isRuntimeClipboardMimeType(transfer.mimeType) ||
+      typeof transfer.size !== "number" ||
+      !Number.isSafeInteger(transfer.size) ||
+      transfer.size <= 0 ||
+      transfer.size > maximumRuntimeClipboardImageBytes ||
+      typeof transfer.chunkCount !== "number" ||
+      !Number.isSafeInteger(transfer.chunkCount) ||
+      transfer.chunkCount <= 0 ||
+      transfer.chunkCount > 4_096 ||
+      this.incomingClipboardTransfers.size >= 4
+    ) {
+      if (typeof transfer.id === "string" && runtimeClipboardTransferIdPattern.test(transfer.id)) {
+        this.sendClipboardAcknowledgement(socket, transfer.id, false, { error: "Invalid clipboard transfer" });
+      }
+      return;
+    }
+    if (this.incomingClipboardTransfers.has(transfer.id)) {
+      this.rejectClipboardTransfer(socket, transfer.id, "Clipboard transfer replaced");
+    }
+    const timer = setTimeout(() => {
+      this.rejectClipboardTransfer(socket, transfer.id as string, "Clipboard transfer timed out");
+    }, 30_000);
+    timer.unref();
+    this.incomingClipboardTransfers.set(transfer.id, {
+      mimeType: transfer.mimeType,
+      size: transfer.size,
+      chunkCount: transfer.chunkCount,
+      chunks: new Array<Buffer | undefined>(transfer.chunkCount),
+      receivedBytes: 0,
+      timer,
+    });
+  }
+
+  private handleClipboardChunk(socket: WebSocket, event: JsonObject): void {
+    if (
+      typeof event.transferId !== "string" ||
+      !runtimeClipboardTransferIdPattern.test(event.transferId)
+    ) return;
+    const transfer = this.incomingClipboardTransfers.get(event.transferId);
+    if (!transfer) return;
+    if (
+      typeof event.index !== "number" ||
+      !Number.isSafeInteger(event.index) ||
+      event.index < 0 ||
+      event.index >= transfer.chunkCount ||
+      typeof event.data !== "string" ||
+      event.data.length === 0 ||
+      event.data.length > maximumRuntimeClipboardChunkCharacters ||
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(event.data) ||
+      transfer.chunks[event.index]
+    ) {
+      this.rejectClipboardTransfer(socket, event.transferId, "Invalid clipboard chunk");
+      return;
+    }
+    const chunk = Buffer.from(event.data, "base64");
+    transfer.chunks[event.index] = chunk;
+    transfer.receivedBytes += chunk.length;
+    if (transfer.receivedBytes > transfer.size) {
+      this.rejectClipboardTransfer(socket, event.transferId, "Clipboard transfer exceeds declared size");
+    }
+  }
+
+  private async handleClipboardEnd(socket: WebSocket, event: JsonObject): Promise<void> {
+    if (
+      typeof event.transferId !== "string" ||
+      !runtimeClipboardTransferIdPattern.test(event.transferId)
+    ) return;
+    const transferId = event.transferId;
+    const transfer = this.incomingClipboardTransfers.get(transferId);
+    if (!transfer) return;
+    clearTimeout(transfer.timer);
+    this.incomingClipboardTransfers.delete(transferId);
+    try {
+      if (transfer.receivedBytes !== transfer.size || transfer.chunks.some((chunk) => !chunk)) {
+        throw new Error("Clipboard transfer is incomplete");
+      }
+      const bytes = Buffer.concat(transfer.chunks as Buffer[], transfer.size);
+      const directory = await this.ensureClipboardDirectory();
+      if (this.stopped) throw new Error("Runtime is stopping");
+      const path = await materializeRuntimeClipboardImage(directory, bytes, transfer.mimeType);
+      this.sendClipboardAcknowledgement(socket, transferId, true, { path });
+    } catch (error) {
+      this.sendClipboardAcknowledgement(socket, transferId, false, {
+        error: error instanceof Error ? error.message : "Clipboard transfer failed",
+      });
+    }
+  }
+
+  private async ensureClipboardDirectory(): Promise<string> {
+    if (this.clipboardDirectory) return this.clipboardDirectory;
+    const directory = await mkdtemp(join(tmpdir(), "vibcodrx-clipboard-"));
+    await chmod(directory, 0o700);
+    this.clipboardDirectory = directory;
+    return directory;
   }
 
   private async refreshThread(): Promise<void> {
@@ -515,6 +768,7 @@ export async function runManagedCodex(args: string[]): Promise<void> {
   const workspace = await resolveWorkspace(session, cwd);
   const address = runtimeAddress();
   const capability = runtimeCapability();
+  const clipboardCapability = runtimeCapability();
   const appServerPort = await getFreeLoopbackPort();
   const appServerUrl = `ws://127.0.0.1:${appServerPort}`;
   const adapter = new AppServerAdapter(appServerUrl);
@@ -566,7 +820,15 @@ export async function runManagedCodex(args: string[]): Promise<void> {
     await appServerSpawned;
     await waitForAppServer(appServerUrl, appServer);
     await adapter.connect();
-    bridge = new RuntimeBridge(session, adapter, workspace, cwd, address, capability);
+    bridge = new RuntimeBridge(
+      session,
+      adapter,
+      workspace,
+      cwd,
+      address,
+      capability,
+      clipboardCapability,
+    );
     bridge.start();
     const proxyPort = await getFreeLoopbackPort();
     proxyServer = new WebSocketServer({ host: "127.0.0.1", port: proxyPort });

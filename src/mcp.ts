@@ -156,7 +156,7 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
     { name: "vibcodrx", version: packageVersion },
     {
       instructions:
-        "Este MCP significa que a sessão Codex está no harness Vibcodrx em um host autenticado. O backend fornece o estado persistido do desktop e o runtime vivo dos Terminais locais/remotos. Use list_available_threads imediatamente antes de send_message e somente o address retornado; evite loopings, se não for necessário responder, não responda. Para estado persistido, comece por list_workspaces e get_workspace_context. Anotações exigem terminalId ligado por corda; nunca invente IDs. Tasks pertencem ao Workspace resolvido deste projeto. O filesystem não passa por este MCP.",
+        "Este MCP significa que a sessão Codex está no harness Vibcodrx em um host autenticado. O backend fornece o estado persistido do desktop e o runtime vivo dos Terminais locais/remotos. Use list_available_threads imediatamente antes de send_message e somente o address retornado; evite loopings, se não for necessário responder, não responda. Para estado persistido, comece por list_workspaces e get_workspace_context. Anotações exigem terminalId ligado por corda; nunca invente IDs. Tasks pertencem ao Workspace resolvido deste projeto. Imagens coladas chegam como input nativo do Codex, não como tool MCP. O filesystem não passa por este MCP.",
     },
   );
 
