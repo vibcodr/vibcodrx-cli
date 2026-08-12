@@ -327,6 +327,7 @@ class RuntimeBridge {
   private published = false;
   private clipboardBindingAnnounced = false;
   private clipboardDirectory: string | null = null;
+  private clipboardDirectoryPromise: Promise<string> | null = null;
   private readonly incomingClipboardTransfers = new Map<string, IncomingClipboardTransfer>();
 
   constructor(
@@ -685,10 +686,23 @@ class RuntimeBridge {
 
   private async ensureClipboardDirectory(): Promise<string> {
     if (this.clipboardDirectory) return this.clipboardDirectory;
-    const directory = await mkdtemp(join(tmpdir(), "vibcodrx-clipboard-"));
-    await chmod(directory, 0o700);
-    this.clipboardDirectory = directory;
-    return directory;
+    if (!this.clipboardDirectoryPromise) {
+      this.clipboardDirectoryPromise = (async () => {
+        const directory = await mkdtemp(join(tmpdir(), "vibcodrx-clipboard-"));
+        await chmod(directory, 0o700);
+        if (this.stopped) {
+          rmSync(directory, { recursive: true, force: true });
+          throw new Error("Runtime is stopping");
+        }
+        this.clipboardDirectory = directory;
+        return directory;
+      })();
+    }
+    try {
+      return await this.clipboardDirectoryPromise;
+    } finally {
+      this.clipboardDirectoryPromise = null;
+    }
   }
 
   private async refreshThread(): Promise<void> {
