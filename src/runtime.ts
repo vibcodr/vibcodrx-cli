@@ -1,10 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
-import { rmSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 
@@ -127,6 +128,15 @@ export function appServerArguments(endpoint: string): string[] {
   ];
 }
 
+export function appServerGuardArguments(endpoint: string): string[] {
+  return [
+    fileURLToPath(new URL("./app-server-guard.js", import.meta.url)),
+    "--",
+    "codex",
+    ...appServerArguments(endpoint),
+  ];
+}
+
 export function threadSummaryRequest(threadId: string): {
   threadId: string;
   includeTurns: false;
@@ -196,7 +206,9 @@ async function getFreeLoopbackPort(): Promise<number> {
 
 async function waitForAppServer(url: string, process: ChildProcess): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (process.exitCode !== null) throw new Error("O Codex App Server encerrou durante o startup.");
+    if (process.exitCode !== null || process.signalCode !== null) {
+      throw new Error("O Codex App Server encerrou durante o startup.");
+    }
     try {
       const response = await fetch(`${url.replace("ws://", "http://")}/readyz`);
       if (response.ok) return;
@@ -206,6 +218,62 @@ async function waitForAppServer(url: string, process: ChildProcess): Promise<voi
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("O Codex App Server não ficou pronto a tempo.");
+}
+
+function childHasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child: ChildProcess, timeoutMilliseconds: number): Promise<boolean> {
+  if (childHasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("exit", handleExit);
+      child.off("error", handleExit);
+      resolve(exited);
+    };
+    const handleExit = (): void => finish(true);
+    const timer = setTimeout(() => finish(childHasExited(child)), timeoutMilliseconds);
+    child.once("exit", handleExit);
+    child.once("error", handleExit);
+    if (childHasExited(child)) finish(true);
+  });
+}
+
+function linuxProcessSessionId(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return null;
+    const sessionId = Number(stat.slice(commandEnd + 2).trim().split(/\s+/)[3]);
+    return Number.isSafeInteger(sessionId) ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+function signalLinuxProcessSession(sessionId: number, signal: NodeJS.Signals): void {
+  if (process.platform !== "linux") return;
+  let processIds: number[];
+  try {
+    processIds = readdirSync("/proc")
+      .filter((entry) => /^\d+$/.test(entry))
+      .map(Number);
+  } catch {
+    return;
+  }
+  for (const pid of processIds) {
+    if (linuxProcessSessionId(pid) !== sessionId) continue;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The process may have exited between the identity check and the signal.
+    }
+  }
 }
 
 class AppServerAdapter {
@@ -787,7 +855,7 @@ export async function runManagedCodex(args: string[]): Promise<void> {
   const appServerUrl = `ws://127.0.0.1:${appServerPort}`;
   const adapter = new AppServerAdapter(appServerUrl);
   let bridge: RuntimeBridge | null = null;
-  const appServer = spawn("codex", appServerArguments(appServerUrl), {
+  const appServer = spawn(process.execPath, appServerGuardArguments(appServerUrl), {
     cwd,
     env: {
       ...process.env,
@@ -796,25 +864,33 @@ export async function runManagedCodex(args: string[]): Promise<void> {
       VIBCODRX_RUNTIME_WORKSPACE_NAME: workspace.name,
       ...(workspace.id ? { VIBCODRX_RUNTIME_WORKSPACE_ID: workspace.id } : {}),
     },
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["pipe", "ignore", "ignore"],
     detached: process.platform !== "win32",
   });
+  const appServerSessionId = appServer.pid;
   const killAppServer = (signal: NodeJS.Signals): void => {
-    if (appServer.exitCode !== null || appServer.pid === undefined) return;
-    if (process.platform !== "win32") {
-      try {
-        process.kill(-appServer.pid, signal);
-        return;
-      } catch {
-        // Fall back to killing only the direct child.
-      }
+    if (childHasExited(appServer)) return;
+    try {
+      appServer.kill(signal);
+    } catch {
+      // The guard may have exited between the state check and the signal.
     }
-    appServer.kill(signal);
   };
-  appServer.stderr?.setEncoding("utf8");
-  appServer.stderr?.on("data", () => {
-    // Consume diagnostics without echoing data that may contain user paths or secrets.
-  });
+  const forceAppServerSession = (): void => {
+    if (appServerSessionId !== undefined) {
+      signalLinuxProcessSession(appServerSessionId, "SIGKILL");
+    }
+    killAppServer("SIGKILL");
+  };
+  const stopAppServer = async (): Promise<void> => {
+    if (childHasExited(appServer)) return;
+    appServer.stdin?.end();
+    if (await waitForChildExit(appServer, 1_500)) return;
+    killAppServer("SIGTERM");
+    if (await waitForChildExit(appServer, 1_000)) return;
+    forceAppServerSession();
+    await waitForChildExit(appServer, 500);
+  };
 
   let proxyServer: WebSocketServer | null = null;
   let tui: ChildProcess | null = null;
@@ -822,10 +898,18 @@ export async function runManagedCodex(args: string[]): Promise<void> {
     appServer.once("spawn", resolve);
     appServer.once("error", () => reject(new Error("Não foi possível iniciar o Codex App Server.")));
   });
+  appServer.once("exit", () => {
+    if (appServerSessionId !== undefined) {
+      signalLinuxProcessSession(appServerSessionId, "SIGKILL");
+    }
+  });
   const swallowSigint = (): void => undefined;
+  let terminationRequested = false;
   const handleTermination = (signal: NodeJS.Signals): void => {
+    if (terminationRequested) return;
+    terminationRequested = true;
     if (tui?.exitCode === null) tui.kill(signal);
-    else killAppServer(signal);
+    killAppServer(signal);
   };
   process.on("SIGINT", swallowSigint);
   process.on("SIGTERM", handleTermination);
@@ -925,12 +1009,6 @@ export async function runManagedCodex(args: string[]): Promise<void> {
     proxyServer?.close();
     adapter.close();
     if (tui?.exitCode === null) tui.kill("SIGTERM");
-    if (appServer.exitCode === null) {
-      killAppServer("SIGTERM");
-      const forceTimer = setTimeout(() => {
-        if (appServer.exitCode === null) killAppServer("SIGKILL");
-      }, 1_000);
-      forceTimer.unref();
-    }
+    await stopAppServer();
   }
 }

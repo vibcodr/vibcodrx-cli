@@ -11,6 +11,7 @@ import { createVibcodrxMcpServer } from "../src/mcp.js";
 import { sanitizeRemoteUrl } from "../src/project.js";
 import {
   appServerArguments,
+  appServerGuardArguments,
   materializeRuntimeClipboardImage,
   runtimeClipboardBindingSequence,
   runtimeClipboardUnbindingSequence,
@@ -60,6 +61,16 @@ describe("Vibcodrx CLI", () => {
       "VIBCODRX_RUNTIME_CAPABILITY",
       "VIBCODRX_RUNTIME_WORKSPACE_ID",
       "VIBCODRX_RUNTIME_WORKSPACE_NAME",
+    ]);
+  });
+
+  it("inicia o App Server por um guard preso ao ciclo de vida do supervisor", () => {
+    const args = appServerGuardArguments("ws://127.0.0.1:4500");
+    expect(args[0]).toMatch(/app-server-guard\.js$/);
+    expect(args.slice(1)).toEqual([
+      "--",
+      "codex",
+      ...appServerArguments("ws://127.0.0.1:4500"),
     ]);
   });
 

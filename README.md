@@ -14,8 +14,7 @@ O comando sem argumentos conduz um único fluxo:
 1. verifica se o Codex está instalado;
 2. abre a autorização do host no navegador, sem receber sua senha no terminal;
 3. registra o servidor MCP stdio com `codex mcp add vibcodrx -- vibcodrx mcp`;
-4. instala a função de shell que preserva o comando `codex` e ativa o runtime distribuído;
-5. valida a conta e a API.
+4. instala a função de shell que preserva o comando `codex` e ativa o runtime distribuído.
 
 Depois da configuração, use normalmente:
 
