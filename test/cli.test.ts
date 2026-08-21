@@ -10,27 +10,15 @@ import { runCli } from "../src/cli.js";
 import { createVibcodrxMcpServer } from "../src/mcp.js";
 import { sanitizeRemoteUrl } from "../src/project.js";
 import {
-  appServerArguments,
-  appServerGuardArguments,
   materializeRuntimeClipboardImage,
-  runtimeClipboardBindingSequence,
-  runtimeClipboardUnbindingSequence,
-  runtimeMcpEnvironmentVariables,
-  threadSummaryRequest,
 } from "../src/runtime.js";
 
 describe("Vibcodrx CLI", () => {
   const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
-  const originalRuntimeAddress = process.env.VIBCODRX_RUNTIME_ADDRESS;
-  const originalRuntimeCapability = process.env.VIBCODRX_RUNTIME_CAPABILITY;
 
   afterEach(() => {
     if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
-    if (originalRuntimeAddress === undefined) delete process.env.VIBCODRX_RUNTIME_ADDRESS;
-    else process.env.VIBCODRX_RUNTIME_ADDRESS = originalRuntimeAddress;
-    if (originalRuntimeCapability === undefined) delete process.env.VIBCODRX_RUNTIME_CAPABILITY;
-    else process.env.VIBCODRX_RUNTIME_CAPABILITY = originalRuntimeCapability;
   });
 
   it("aceita HTTPS público e limita HTTP a loopback", () => {
@@ -47,47 +35,6 @@ describe("Vibcodrx CLI", () => {
       .toBe("ssh://github.com/vibcodr/vibcodrx");
     expect(sanitizeRemoteUrl("https://token@example.com/org/repo.git?secret=1"))
       .toBe("https://example.com/org/repo");
-  });
-
-  it("encaminha somente o contexto runtime efêmero ao MCP do App Server", () => {
-    const args = appServerArguments("ws://127.0.0.1:4500");
-    expect(args).toContain("app-server");
-    expect(args).toContain("ws://127.0.0.1:4500");
-    expect(args.at(-1)).toBe(
-      `mcp_servers.vibcodrx.env_vars=${JSON.stringify(runtimeMcpEnvironmentVariables)}`,
-    );
-    expect(runtimeMcpEnvironmentVariables).toEqual([
-      "VIBCODRX_RUNTIME_ADDRESS",
-      "VIBCODRX_RUNTIME_CAPABILITY",
-      "VIBCODRX_RUNTIME_WORKSPACE_ID",
-      "VIBCODRX_RUNTIME_WORKSPACE_NAME",
-    ]);
-  });
-
-  it("inicia o App Server por um guard preso ao ciclo de vida do supervisor", () => {
-    const args = appServerGuardArguments("ws://127.0.0.1:4500");
-    expect(args[0]).toMatch(/app-server-guard\.js$/);
-    expect(args.slice(1)).toEqual([
-      "--",
-      "codex",
-      ...appServerArguments("ws://127.0.0.1:4500"),
-    ]);
-  });
-
-  it("consulta somente o summary estável da thread antes de entregar mensagens", () => {
-    expect(threadSummaryRequest("thread-123")).toEqual({
-      threadId: "thread-123",
-      includeTurns: false,
-    });
-  });
-
-  it("anuncia ao terminal somente o endereço remoto e a capability efêmera do clipboard", () => {
-    expect(runtimeClipboardBindingSequence("terminal-remote123456", "p".repeat(48))).toBe(
-      `\u001b]777;vibcodrx;remote-runtime;bind;terminal-remote123456;${"p".repeat(48)}\u0007`,
-    );
-    expect(runtimeClipboardUnbindingSequence("terminal-remote123456")).toBe(
-      "\u001b]777;vibcodrx;remote-runtime;clear;terminal-remote123456\u0007",
-    );
   });
 
   it("materializa imagem remota em arquivo privado e rejeita assinatura falsa", async () => {
@@ -124,6 +71,10 @@ describe("Vibcodrx CLI", () => {
     expect(output.join("")).not.toContain("Sessão Vibcodrx encerrada");
   });
 
+  it("não oferece mais um comando de supervisão do Codex", async () => {
+    await expect(runCli(["codex", "--"])).rejects.toThrow(/Comando desconhecido/);
+  });
+
   it("conclui o handshake e lista ferramentas mesmo sem rede ou login", async () => {
     process.env.XDG_CONFIG_HOME = `/tmp/vibcodrx-cli-test-no-session-${process.pid}`;
     const server = createVibcodrxMcpServer(process.cwd());
@@ -140,6 +91,7 @@ describe("Vibcodrx CLI", () => {
         "get_workspace_context",
         "list_available_threads",
         "send_message",
+        "list_incoming_messages",
         "list_connected_notes",
         "read_connected_note",
         "create_connected_note",

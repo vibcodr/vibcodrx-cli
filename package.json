@@ -1,7 +1,7 @@
 {
   "name": "@vibcodrx/cli",
-  "version": "0.2.8",
-  "description": "Conecta o Codex em hosts remotos ao ecossistema Vibcodrx.",
+  "version": "0.3.0",
+  "description": "Bridge MCP autenticado entre o Codex e o backend Vibcodrx.",
   "type": "module",
   "bin": {
     "vibcodrx": "dist/index.js"
@@ -15,6 +15,7 @@
     "node": ">=22.18.0"
   },
   "scripts": {
+    "prebuild": "node scripts/clean-dist.mjs",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

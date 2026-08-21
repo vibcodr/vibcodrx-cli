@@ -8,8 +8,12 @@ import { sessionApiRequest } from "./api.js";
 import { loadSession, type StoredSession } from "./config.js";
 import { packageVersion } from "./constants.js";
 import { getProjectIdentity } from "./project.js";
+import {
+  startMcpRuntime,
+  stopMcpRuntime,
+  type RuntimeState,
+} from "./runtime.js";
 
-const workspaceIdSchema = z.string().regex(/^workspace-[a-zA-Z0-9-]{1,80}$/);
 const nodeIdSchema = z.string().regex(/^[a-zA-Z][a-zA-Z0-9-]{1,100}$/);
 const taskIdSchema = z.string().regex(/^task-[a-zA-Z0-9-]{1,80}$/);
 const runtimeAddressSchema = z.string().regex(/^terminal-[A-Za-z0-9_-]{12,100}$/);
@@ -19,6 +23,8 @@ const tiptapContentSchema = z
   .refine((content) => content.type === "doc", "Conteúdo TipTap inválido.");
 
 type JsonObject = Record<string, unknown>;
+
+let activeRuntimeState: RuntimeState | null = null;
 
 function textResult(value: unknown): CallToolResult {
   return {
@@ -92,27 +98,19 @@ function createSessionLoader(): () => Promise<StoredSession> {
 }
 
 function runtimeContext(): { address: string; capability: string } {
-  const address = process.env.VIBCODRX_RUNTIME_ADDRESS;
-  const capability = process.env.VIBCODRX_RUNTIME_CAPABILITY;
-  if (!address || !capability) {
-    throw new Error(
-      "Esta sessão Codex não foi iniciada pelo runtime distribuído do Vibcodrx. Execute `vibcodrx`, abra um novo shell e inicie `codex` novamente.",
-    );
-  }
-  return {
-    address: runtimeAddressSchema.parse(address),
-    capability: z.string().min(32).max(256).parse(capability),
-  };
+  const bridge = activeRuntimeState?.current;
+  if (bridge) return { address: bridge.address, capability: bridge.capability };
+  throw new Error(
+    "O runtime MCP ainda não está conectado. Verifique `vibcodrx mcp login` e reinicie o Codex.",
+  );
 }
 
 function runtimeWorkspaceId(): string {
-  const workspaceId = process.env.VIBCODRX_RUNTIME_WORKSPACE_ID;
-  if (!workspaceId) {
-    throw new Error(
-      "O projeto atual ainda não está vinculado a um Workspace Vibcodrx. Abra o mesmo projeto no desktop e sincronize o Workspace antes de usar esta ferramenta.",
-    );
-  }
-  return workspaceIdSchema.parse(workspaceId);
+  const workspaceId = activeRuntimeState?.current?.workspace.id;
+  if (workspaceId) return workspaceId;
+  throw new Error(
+    "O projeto atual ainda não está vinculado a um Workspace Vibcodrx. Abra o mesmo projeto no desktop e sincronize o Workspace antes de usar esta ferramenta.",
+  );
 }
 
 async function readNoteRevision(
@@ -156,7 +154,7 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
     { name: "vibcodrx", version: packageVersion },
     {
       instructions:
-        "Este MCP significa que a sessão Codex está no harness Vibcodrx em um host autenticado. O backend fornece o estado persistido do desktop e o runtime vivo dos Terminais locais/remotos. Use list_available_threads imediatamente antes de send_message e somente o address retornado; evite loopings, se não for necessário responder, não responda. Para estado persistido, comece por list_workspaces e get_workspace_context. Anotações exigem terminalId ligado por corda; nunca invente IDs. Tasks pertencem ao Workspace resolvido deste projeto. Imagens coladas chegam como input nativo do Codex, não como tool MCP. O filesystem não passa por este MCP.",
+        "Este MCP é o bridge autenticado do Vibcodrx. O backend fornece o estado persistido dos Workspaces e o runtime vivo dos hosts. Use list_available_threads imediatamente antes de send_message e somente o address retornado; evite loopings. Para estado persistido, comece por list_workspaces e get_workspace_context. Anotações exigem terminalId ligado por corda; nunca invente IDs. Tasks pertencem ao Workspace resolvido deste projeto. Imagens coladas chegam como input nativo do Codex; o bridge apenas materializa o arquivo temporário no host. O filesystem não passa por este MCP.",
     },
   );
 
@@ -236,9 +234,9 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
   server.registerTool(
     "list_available_threads",
     {
-      title: "Listar Terminais Codex conectados",
+      title: "Listar runtimes MCP conectados",
       description:
-        "Fonte atual das sessões Codex vivas no tenant, locais ou remotas. Chame imediatamente antes de enviar e use somente address.",
+        "Fonte atual dos bridges MCP vivos no tenant, locais ou remotos. Chame imediatamente antes de enviar e use somente o address retornado.",
       inputSchema: z.object({}).strict(),
       annotations: {
         readOnlyHint: true,
@@ -269,7 +267,7 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
   server.registerTool(
     "send_message",
     {
-      title: "Enviar mensagem a outro Terminal Codex",
+      title: "Enviar mensagem a outro runtime MCP",
       description:
         "Envia contexto ao address da última listagem. replyTo responde ao ID recebido. Evite loopings, se não for necessário responder, não responda.",
       inputSchema: z
@@ -303,6 +301,31 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
             }),
           }),
         );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_incoming_messages",
+    {
+      title: "Ler mensagens recebidas",
+      description:
+        "Lê e remove da fila local as mensagens entregues a este runtime MCP. Cada mensagem contém o address e o ID necessários para responder.",
+      inputSchema: z.object({}).strict(),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      try {
+        const bridge = activeRuntimeState?.current;
+        if (!bridge) throw new Error("O runtime MCP ainda não está conectado.");
+        return textResult({ messages: bridge.drainIncomingMessages() });
       } catch (error) {
         return errorResult(error);
       }
@@ -723,6 +746,9 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
 }
 
 export async function runMcpServer(cwd = process.cwd()): Promise<void> {
+  const runtimeState: RuntimeState = { current: null, closed: false };
+  activeRuntimeState = runtimeState;
+  void startMcpRuntime(cwd, runtimeState).catch(() => undefined);
   const handle = serveStdio(() => createVibcodrxMcpServer(cwd), {
     onerror: (error) => console.error(`Vibcodrx MCP: ${error.message}`),
   });
@@ -731,7 +757,11 @@ export async function runMcpServer(cwd = process.cwd()): Promise<void> {
     const close = (): void => {
       if (closing) return;
       closing = true;
-      void handle.close().finally(resolve);
+      stopMcpRuntime(runtimeState);
+      void handle.close().finally(() => {
+        if (activeRuntimeState === runtimeState) activeRuntimeState = null;
+        resolve();
+      });
     };
     process.once("SIGINT", close);
     process.once("SIGTERM", close);
