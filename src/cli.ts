@@ -4,11 +4,13 @@ import {
   ensureCodexInstalled,
   getCodexMcpEntry,
   getCodexVersion,
+  isExpectedCodexMcpEntry,
 } from "./codex.js";
 import { normalizeApiUrl, sessionApiRequest, validateSession } from "./api.js";
 import { loginWithDeviceFlow } from "./device-auth.js";
 import { packageVersion } from "./constants.js";
 import { runMcpServer } from "./mcp.js";
+import { getProjectIdentity } from "./project.js";
 
 function apiUrlArgument(args: string[]): string | undefined {
   const index = args.indexOf("--api-url");
@@ -89,7 +91,7 @@ async function status(): Promise<void> {
   const mcp = codexVersion ? await getCodexMcpEntry() : null;
   process.stdout.write(`Codex: ${codexVersion || "não encontrado"}\n`);
   process.stdout.write(
-    `MCP Vibcodrx: ${mcp ? "configurado" : "não configurado"}\n`,
+    `MCP Vibcodrx: ${!mcp ? "não configurado" : isExpectedCodexMcpEntry(mcp) ? "configurado" : "divergente"}\n`,
   );
   if (!session) {
     process.stdout.write("Conta: não autenticada\n");
@@ -115,12 +117,12 @@ async function doctor(): Promise<void> {
   const codexVersion = await getCodexVersion();
   check("Codex", Boolean(codexVersion), codexVersion || "não encontrado");
   const entry = codexVersion ? await getCodexMcpEntry() : null;
-  const expectedMcp =
-    entry?.transport?.type === "stdio" &&
-    entry.transport.command === "vibcodrx" &&
-    Array.isArray(entry.transport.args) &&
-    entry.transport.args[0] === "mcp";
-  check("MCP", expectedMcp, expectedMcp ? "vibcodrx mcp" : "ausente ou divergente");
+  const expectedMcp = isExpectedCodexMcpEntry(entry);
+  check(
+    "MCP",
+    expectedMcp,
+    expectedMcp ? `${entry!.transport!.command} mcp` : "ausente ou divergente",
+  );
 
   const session = await loadSession();
   if (!session) {
@@ -129,10 +131,39 @@ async function doctor(): Promise<void> {
     try {
       const identity = await currentIdentity(session);
       check("Autenticação", true, `${identity.user.email} · ${session.apiUrl}`);
+    } catch (error) {
+      check("Autenticação", false, error instanceof Error ? error.message : String(error));
+    }
+    try {
       await sessionApiRequest(session, "/v1/mcp/inventory");
       check("Protocolo MCP", true, "inventário remoto acessível");
     } catch (error) {
-      check("Autenticação", false, error instanceof Error ? error.message : String(error));
+      check("Protocolo MCP", false, error instanceof Error ? error.message : String(error));
+    }
+    try {
+      const project = await getProjectIdentity();
+      const resolution = await sessionApiRequest<Record<string, unknown>>(
+        session,
+        "/v1/projects/resolve",
+        { method: "POST", body: JSON.stringify(project) },
+      );
+      const match = resolution.match;
+      const matched = Boolean(
+        match &&
+        typeof match === "object" &&
+        !Array.isArray(match) &&
+        typeof (match as Record<string, unknown>).workspaceId === "string" &&
+        typeof (match as Record<string, unknown>).workspaceName === "string",
+      );
+      check(
+        "Workspace atual",
+        matched,
+        matched
+          ? `${(match as Record<string, unknown>).workspaceName} · ${(match as Record<string, unknown>).workspaceId}`
+          : `${project.label} sem vínculo no desktop`,
+      );
+    } catch (error) {
+      check("Workspace atual", false, error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -168,7 +199,7 @@ Uso:
   vibcodrx login           autentica este host
   vibcodrx logout          encerra a sessão deste host
   vibcodrx status          mostra o estado atual
-  vibcodrx doctor          valida Codex, MCP, conta e API
+  vibcodrx doctor          valida Codex, MCP, conta, API e o Workspace atual
   vibcodrx mcp             inicia o servidor MCP stdio (usado pelo Codex)
 
 Opções:

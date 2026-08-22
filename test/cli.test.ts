@@ -7,10 +7,17 @@ import { join } from "node:path";
 
 import { normalizeApiUrl } from "../src/api.js";
 import { runCli } from "../src/cli.js";
+import {
+  cliExecutableCommand,
+  isExpectedCodexMcpEntry,
+} from "../src/codex.js";
 import { createVibcodrxMcpServer } from "../src/mcp.js";
 import { sanitizeRemoteUrl } from "../src/project.js";
 import {
   materializeRuntimeClipboardImage,
+  runtimeTerminalBindingSequence,
+  runtimeTerminalUnbindingSequence,
+  runtimeWorkspaceRetryDelayMs,
 } from "../src/runtime.js";
 
 describe("Vibcodrx CLI", () => {
@@ -28,6 +35,19 @@ describe("Vibcodrx CLI", () => {
       .toBe("http://127.0.0.1:4100");
     expect(() => normalizeApiUrl("http://example.com"))
       .toThrow(/HTTPS/);
+  });
+
+  it("fixa o MCP no executável absoluto da CLI em vez de depender do PATH", () => {
+    const command = "/opt/vibcodrx/bin/vibcodrx";
+    expect(cliExecutableCommand(command)).toBe(command);
+    expect(isExpectedCodexMcpEntry({
+      enabled: true,
+      transport: { type: "stdio", command, args: ["mcp"] },
+    }, command)).toBe(true);
+    expect(isExpectedCodexMcpEntry({
+      enabled: true,
+      transport: { type: "stdio", command: "vibcodrx", args: ["mcp"] },
+    }, command)).toBe(false);
   });
 
   it("remove usuário, senha e sufixo Git do remote antes do fingerprint", () => {
@@ -52,6 +72,24 @@ describe("Vibcodrx CLI", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("limita o backoff da resolução tardia de Workspace", () => {
+    expect(runtimeWorkspaceRetryDelayMs(-1)).toBe(1_000);
+    expect(runtimeWorkspaceRetryDelayMs(0)).toBe(1_000);
+    expect(runtimeWorkspaceRetryDelayMs(1)).toBe(2_000);
+    expect(runtimeWorkspaceRetryDelayMs(4)).toBe(16_000);
+    expect(runtimeWorkspaceRetryDelayMs(20)).toBe(30_000);
+  });
+
+  it("anuncia o endereço do runtime pelo canal privado do Terminal", () => {
+    const address = "terminal-runtime123456";
+    expect(runtimeTerminalBindingSequence(address)).toBe(
+      `\u001b]777;vibcodrx;remote-runtime;bind;${address}\u0007`,
+    );
+    expect(runtimeTerminalUnbindingSequence(address)).toBe(
+      `\u001b]777;vibcodrx;remote-runtime;clear;${address}\u0007`,
+    );
   });
 
   it("trata ajuda após um subcomando sem executar a ação", async () => {

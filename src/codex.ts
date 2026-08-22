@@ -1,9 +1,10 @@
 import { createInterface } from "node:readline/promises";
+import { isAbsolute } from "node:path";
 
 import { mcpServerName } from "./constants.js";
 import { commandExists, runCommand } from "./process.js";
 
-type CodexMcpEntry = {
+export type CodexMcpEntry = {
   name?: unknown;
   enabled?: unknown;
   transport?: {
@@ -12,6 +13,10 @@ type CodexMcpEntry = {
     args?: unknown;
   };
 };
+
+export function cliExecutableCommand(value = process.argv[1]): string {
+  return value && isAbsolute(value) ? value : "vibcodrx";
+}
 
 export async function getCodexVersion(): Promise<string | null> {
   if (!(await commandExists("codex"))) return null;
@@ -62,12 +67,15 @@ export async function getCodexMcpEntry(): Promise<CodexMcpEntry | null> {
   }
 }
 
-function isExpectedEntry(entry: CodexMcpEntry | null): boolean {
+export function isExpectedCodexMcpEntry(
+  entry: CodexMcpEntry | null,
+  command = cliExecutableCommand(),
+): boolean {
   return Boolean(
     entry &&
       entry.enabled !== false &&
       entry.transport?.type === "stdio" &&
-      entry.transport.command === "vibcodrx" &&
+      entry.transport.command === command &&
       Array.isArray(entry.transport.args) &&
       entry.transport.args.length === 1 &&
       entry.transport.args[0] === "mcp",
@@ -75,8 +83,9 @@ function isExpectedEntry(entry: CodexMcpEntry | null): boolean {
 }
 
 export async function configureCodexMcp(): Promise<"unchanged" | "configured"> {
+  const command = cliExecutableCommand();
   const existing = await getCodexMcpEntry();
-  if (isExpectedEntry(existing)) return "unchanged";
+  if (isExpectedCodexMcpEntry(existing, command)) return "unchanged";
 
   if (existing) {
     const removed = await runCommand("codex", ["mcp", "remove", mcpServerName], {
@@ -88,13 +97,13 @@ export async function configureCodexMcp(): Promise<"unchanged" | "configured"> {
   }
   const added = await runCommand(
     "codex",
-    ["mcp", "add", mcpServerName, "--", "vibcodrx", "mcp"],
+    ["mcp", "add", mcpServerName, "--", command, "mcp"],
     { timeoutMs: 10_000 },
   );
   if (added.exitCode !== 0) {
     throw new Error(added.stderr.trim() || "Não foi possível registrar o MCP no Codex.");
   }
-  if (!isExpectedEntry(await getCodexMcpEntry())) {
+  if (!isExpectedCodexMcpEntry(await getCodexMcpEntry(), command)) {
     throw new Error("O Codex não confirmou a configuração esperada do MCP Vibcodrx.");
   }
   return "configured";

@@ -1,6 +1,6 @@
 {
   "name": "@vibcodrx/cli",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Bridge MCP autenticado entre o Codex e o backend Vibcodrx.",
   "type": "module",
   "bin": {

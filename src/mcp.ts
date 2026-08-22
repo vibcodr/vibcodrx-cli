@@ -154,7 +154,7 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
     { name: "vibcodrx", version: packageVersion },
     {
       instructions:
-        "Este MCP é o bridge autenticado do Vibcodrx. O backend fornece o estado persistido dos Workspaces e o runtime vivo dos hosts. Use list_available_threads imediatamente antes de send_message e somente o address retornado; evite loopings. Para estado persistido, comece por list_workspaces e get_workspace_context. Anotações exigem terminalId ligado por corda; nunca invente IDs. Tasks pertencem ao Workspace resolvido deste projeto. Imagens coladas chegam como input nativo do Codex; o bridge apenas materializa o arquivo temporário no host. O filesystem não passa por este MCP.",
+        "Este MCP é o bridge autenticado do Vibcodrx. O backend fornece o estado persistido dos Workspaces e o runtime vivo dos hosts. Use list_available_threads imediatamente antes de send_message e somente o address retornado; evite loopings. Para estado persistido, comece por list_workspaces e get_workspace_context. Anotações exigem terminalId ligado por corda; nunca invente IDs. Tasks pertencem ao Workspace resolvido deste projeto. O bloco de notas livre da sidebar é privado da interface e não está disponível neste MCP. Imagens coladas chegam como input nativo do Codex; o bridge apenas materializa o arquivo temporário no host. O filesystem não passa por este MCP.",
     },
   );
 
@@ -746,7 +746,11 @@ export function createVibcodrxMcpServer(cwd: string): McpServer {
 }
 
 export async function runMcpServer(cwd = process.cwd()): Promise<void> {
-  const runtimeState: RuntimeState = { current: null, closed: false };
+  const runtimeState: RuntimeState = {
+    current: null,
+    closed: false,
+    workspaceResolutionTimer: null,
+  };
   activeRuntimeState = runtimeState;
   void startMcpRuntime(cwd, runtimeState).catch(() => undefined);
   const handle = serveStdio(() => createVibcodrxMcpServer(cwd), {

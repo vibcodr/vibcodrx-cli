@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
-import { rmSync } from "node:fs";
+import { closeSync, openSync, rmSync, writeSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -54,6 +54,7 @@ type RuntimeWorkspaceResolution = {
 
 const maximumRuntimeClipboardImageBytes = 25 * 1_024 * 1_024;
 const maximumRuntimeClipboardChunkCharacters = 70_000;
+const maximumWorkspaceResolutionRetryDelayMs = 30_000;
 const runtimeClipboardTransferIdPattern = /^clipboard_[0-9a-f-]{36}$/;
 const runtimeClipboardMimeTypes = new Set<RuntimeClipboardMimeType>([
   "image/gif",
@@ -68,8 +69,40 @@ const runtimeClipboardExtensions: Record<RuntimeClipboardMimeType, string> = {
   "image/webp": "webp",
 };
 
+export function runtimeTerminalBindingSequence(address: string): string {
+  return `\u001b]777;vibcodrx;remote-runtime;bind;${address}\u0007`;
+}
+
+export function runtimeTerminalUnbindingSequence(address: string): string {
+  return `\u001b]777;vibcodrx;remote-runtime;clear;${address}\u0007`;
+}
+
+function writeTerminalRuntimeControl(sequence: string): boolean {
+  if (process.platform !== "linux") return false;
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync("/dev/tty", "w");
+    return writeSync(descriptor, sequence) === Buffer.byteLength(sequence);
+  } catch {
+    return false;
+  } finally {
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // The binding is best-effort when the controlling TTY is closing.
+      }
+    }
+  }
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function runtimeWorkspaceRetryDelayMs(attempt: number): number {
+  const normalizedAttempt = Number.isInteger(attempt) && attempt > 0 ? attempt : 0;
+  return Math.min(maximumWorkspaceResolutionRetryDelayMs, 1_000 * (2 ** normalizedAttempt));
 }
 
 function rawDataToString(data: RawData): string {
@@ -178,6 +211,7 @@ export class RuntimeBridge {
   private brokerSocket: WebSocket | null = null;
   private brokerReconnectTimer: NodeJS.Timeout | null = null;
   private brokerReconnectAttempt = 0;
+  private terminalBindingAnnounced = false;
   private stopped = false;
   private presence: RuntimePresence = "idle";
   private clipboardDirectory: string | null = null;
@@ -229,12 +263,14 @@ export class RuntimeBridge {
   }
 
   start(): void {
+    this.announceTerminalBinding();
     this.connectBroker();
   }
 
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.clearTerminalBinding();
     for (const transfer of this.incomingClipboardTransfers.values()) clearTimeout(transfer.timer);
     this.incomingClipboardTransfers.clear();
     if (this.clipboardDirectory) {
@@ -296,6 +332,19 @@ export class RuntimeBridge {
     };
   }
 
+  private announceTerminalBinding(): void {
+    if (this.terminalBindingAnnounced) return;
+    this.terminalBindingAnnounced = writeTerminalRuntimeControl(
+      runtimeTerminalBindingSequence(this.address),
+    );
+  }
+
+  private clearTerminalBinding(): void {
+    if (!this.terminalBindingAnnounced) return;
+    writeTerminalRuntimeControl(runtimeTerminalUnbindingSequence(this.address));
+    this.terminalBindingAnnounced = false;
+  }
+
   private connectBroker(): void {
     if (this.stopped || this.brokerSocket) return;
     const socket = new WebSocket(endpointFor(this.session), {
@@ -309,6 +358,7 @@ export class RuntimeBridge {
     socket.on("open", () => {
       if (this.brokerSocket !== socket) return;
       this.brokerReconnectAttempt = 0;
+      this.announceTerminalBinding();
       socket.send(JSON.stringify({ type: "register", participant: this.participant() }));
     });
     socket.on("message", (data) => void this.handleBrokerMessage(socket, data));
@@ -531,7 +581,53 @@ export class RuntimeBridge {
 export type RuntimeState = {
   current: RuntimeBridge | null;
   closed: boolean;
+  workspaceResolutionTimer: NodeJS.Timeout | null;
 };
+
+function reconcileRuntimeWorkspace(
+  session: StoredSession,
+  cwd: string,
+  initialProject: Awaited<ReturnType<typeof getProjectIdentity>>,
+  state: RuntimeState,
+  bridge: RuntimeBridge,
+): void {
+  let attempt = 0;
+  let firstAttempt = true;
+  let project = initialProject;
+
+  const resolve = async (): Promise<void> => {
+    if (
+      state.closed ||
+      state.current !== bridge ||
+      Date.parse(session.expiresAt) <= Date.now()
+    ) return;
+
+    if (!firstAttempt) {
+      project = await getProjectIdentity(cwd).catch(() => project);
+      if (state.closed || state.current !== bridge) return;
+    }
+    firstAttempt = false;
+    const resolution = await resolveWorkspace(session, cwd, project).catch(() => null);
+    if (state.closed || state.current !== bridge) return;
+
+    if (resolution) {
+      bridge.updateWorkspace(resolution.workspace);
+      if (resolution.workspace.id) return;
+    }
+
+    const retryTimer = setTimeout(() => {
+      if (state.workspaceResolutionTimer === retryTimer) {
+        state.workspaceResolutionTimer = null;
+      }
+      void resolve();
+    }, runtimeWorkspaceRetryDelayMs(attempt));
+    attempt += 1;
+    retryTimer.unref();
+    state.workspaceResolutionTimer = retryTimer;
+  };
+
+  void resolve();
+}
 
 export async function startMcpRuntime(cwd: string, state: RuntimeState): Promise<void> {
   if (state.closed) return;
@@ -546,13 +642,13 @@ export async function startMcpRuntime(cwd: string, state: RuntimeState): Promise
   const bridge = new RuntimeBridge(session, fallback);
   state.current = bridge;
   bridge.start();
-  void resolveWorkspace(session, cwd, project).then((resolution) => {
-    if (!state.closed && state.current === bridge) bridge.updateWorkspace(resolution.workspace);
-  }).catch(() => undefined);
+  reconcileRuntimeWorkspace(session, cwd, project, state, bridge);
 }
 
 export function stopMcpRuntime(state: RuntimeState): void {
   state.closed = true;
+  if (state.workspaceResolutionTimer) clearTimeout(state.workspaceResolutionTimer);
+  state.workspaceResolutionTimer = null;
   state.current?.stop();
   state.current = null;
 }
